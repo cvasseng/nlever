@@ -1,0 +1,20 @@
+{
+  "name": "nlever",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Zero-dependency Node.js deployment tool",
+  "bin": {
+    "nlever-server": "./nlever-server.mjs",
+    "nlever": "./nlever-cli.mjs"
+  },
+  "scripts": {
+    "install-server": "nlever-server --install",
+    "uninstall-server": "nlever-server --uninstall"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": ["deployment", "deploy", "pm2", "node"],
+  "author": "",
+  "license": "MIT"
+}
