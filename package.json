@@ -15,6 +15,6 @@
     "node": ">=14.0.0"
   },
   "keywords": ["deployment", "deploy", "pm2", "node"],
-  "author": "",
+  "author": "Chris Vasseng <hello@vasseng.com>",
   "license": "MIT"
 }
