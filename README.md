@@ -1,6 +1,6 @@
 # nlever
 
-Zero-dependency Node.js deployment tool. Push code through HTTP to any VM without git hooks, SSH keys, or CI/CD setup.
+Zero-dependency Node.js deployment tool. Push code through HTTP to any VM without git hooks, SSH keys, or CI/CD setup. Meant for simple apps in a trusted network.
 
 ## What's up with the name?
 
