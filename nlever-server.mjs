@@ -490,6 +490,50 @@ async function handleRequest(req, res) {
   }
 }
 
+async function install() {
+  try {
+    const serverPath = process.argv[1];
+    const pm2Config = {
+      name: 'nlever-server',
+      script: serverPath,
+      env: {
+        NLEVER_PORT: PORT,
+        NLEVER_BASE_DIR: process.env.NLEVER_BASE_DIR || BASE_DIR,
+        ...(AUTH_TOKEN && { NLEVER_AUTH_TOKEN: AUTH_TOKEN })
+      },
+      autorestart: true,
+      watch: false
+    };
+    
+    const configFile = '/tmp/nlever-server-pm2.json';
+    await fs.writeFile(configFile, JSON.stringify({ apps: [pm2Config] }, null, 2));
+    
+    execSync(`pm2 start ${configFile}`, { stdio: 'inherit' });
+    execSync('pm2 save', { stdio: 'inherit' });
+    execSync('pm2 startup', { stdio: 'inherit' });
+    
+    await fs.unlink(configFile);
+    
+    console.log('✓ nlever-server installed and started with PM2');
+    console.log('✓ PM2 startup script created');
+    console.log(`✓ Server running on port ${PORT}`);
+  } catch (error) {
+    console.error('✗ Installation failed:', error.message);
+    process.exit(1);
+  }
+}
+
+async function uninstall() {
+  try {
+    execSync('pm2 delete nlever-server', { stdio: 'inherit' });
+    execSync('pm2 save', { stdio: 'inherit' });
+    console.log('✓ nlever-server stopped and removed from PM2');
+  } catch (error) {
+    console.error('✗ Uninstallation failed:', error.message);
+    process.exit(1);
+  }
+}
+
 // Check write permissions and fallback if needed
 async function init() {
   try {
@@ -509,4 +553,12 @@ async function init() {
   });
 }
 
-init().catch(console.error);
+// Handle command line arguments
+const args = process.argv.slice(2);
+if (args.includes('--install')) {
+  install();
+} else if (args.includes('--uninstall')) {
+  uninstall();
+} else {
+  init().catch(console.error);
+}

@@ -61,16 +61,26 @@ nlever logs 500  # Last 500 lines
 
 # Rollback to previous version
 nlever rollback
+
+# Stop the app
+nlever stop
+
+# Restart the app  
+nlever restart
+
+# Completely remove the app
+nlever destroy
 ```
 
 ## How It Works
 
 1. **Push**: Creates tar.gz of your project (excluding .git, node_modules, logs, .env)
 2. **Deploy**: Extracts to timestamped release directory
-3. **Activate**: Updates symlinks atomically (current → new release)
-4. **PM2**: Restarts or starts your app with PM2
-5. **Health Check**: Optionally waits for health endpoint to return 200
-6. **Cleanup**: Removes old releases, keeping only the current working version
+3. **Install**: Runs npm/yarn install to install dependencies
+4. **Activate**: Updates symlinks atomically (current → new release)
+5. **PM2**: Restarts or starts your app with PM2
+6. **Health Check**: Optionally waits for health endpoint to return 200
+7. **Cleanup**: Removes old releases, keeping only the current working version
 
 ## Features
 
@@ -79,6 +89,8 @@ nlever rollback
 - **Concurrent Deploy Protection** - Lock files prevent simultaneous deployments
 - **PM2 Integration** - Automatic process management
 - **Health Checks** - Verify deployment success with custom endpoint
+- **Dependency Management** - Automatic npm/yarn install
+- **App Management** - Stop, restart, and destroy commands
 - **Minimal Dependencies** - Only requires Node.js, tar, and PM2
 
 ## Directory Structure
@@ -98,7 +110,10 @@ On the server:
 ## API Endpoints
 
 - `POST /deploy/:appname?health_check=/health` - Deploy application
-- `POST /rollback/:appname` - Rollback to previous version  
+- `POST /rollback/:appname` - Rollback to previous version
+- `POST /stop/:appname` - Stop application
+- `POST /restart/:appname` - Restart application  
+- `POST /destroy/:appname` - Completely remove application
 - `GET /status/:appname` - Get PM2 process status
 - `GET /logs/:appname?lines=100` - Get application logs
 
@@ -106,7 +121,7 @@ On the server:
 
 ### Server
 - `NLEVER_PORT` - Server port (default: 8080)
-- `NLEVER_BASE_DIR` - Base directory for apps (default: /var/www)
+- `NLEVER_BASE_DIR` - Base directory for apps (default: /var/www, fallback: ~/nlever-apps)
 - `NLEVER_AUTH_TOKEN` - Bearer token for authentication (optional)
 
 ### Client
