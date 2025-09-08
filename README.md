@@ -4,7 +4,7 @@ Zero-dependency Node.js deployment tool. Push code through HTTP to any VM withou
 
 ## What's up with the name?
 
-It's a triple-pun: "N" is for Node.js, "lever" as in a simple machine to lift heavy things, "lever" as in Norwegian for "lives" and Norwegian for "deliver".
+It's a triple-pun: "N" is for Node.js, "lever" as in a simple machine to lift heavy things, as in Norwegian for "lives", and finally as in Norwegian for "deliver".
 
 ## Installation
 
@@ -37,17 +37,27 @@ nlever-server --uninstall
 
 ## Client Usage
 
-In your Node.js project directory, create a `.env` file:
+In your Node.js project directory:
+
+```bash
+# Initialize nlever configuration
+nlever init
+
+# Edit .env to set your server host
+nano .env
+```
+
+Or manually create a `.env` file:
 
 ```env
 NLEVER_NAME=myapp
 NLEVER_HOST=server.lan:8080
 NLEVER_AUTH=your-secret-token       # Optional, must match server
 NLEVER_HEALTH_CHECK=/health         # Optional, endpoint to verify deployment
+NLEVER_EXCLUSIONS=.git,node_modules,*.log  # Optional, custom exclusion patterns
 ```
 
-Deploy your application:
-
+**Main Usage**
 ```bash
 # Deploy current directory
 nlever push
@@ -74,7 +84,7 @@ nlever destroy
 
 ## How It Works
 
-1. **Push**: Creates tar.gz of your project (excluding .git, node_modules, logs, .env)
+1. **Push**: Creates tar.gz of your project (default excludes: .git, node_modules, *.log, .env*)
 2. **Deploy**: Extracts to timestamped release directory
 3. **Install**: Runs npm/yarn install to install dependencies
 4. **Activate**: Updates symlinks atomically (current → new release)
@@ -95,9 +105,10 @@ nlever destroy
 
 ## Directory Structure
 
-On the server:
+On the server, the apps are stored as such:
+
 ```
-/var/www/
+<NLEVER_BASE_DIR>/
 ├── .nlever-apps.json      # App registry
 ├── myapp/
 │   ├── current/           → releases/1693847234/
@@ -108,6 +119,8 @@ On the server:
 ```
 
 ## API Endpoints
+
+These are the endpoints exposed by `nlever-server`:
 
 - `POST /deploy/:appname?health_check=/health` - Deploy application
 - `POST /rollback/:appname` - Rollback to previous version
@@ -129,6 +142,7 @@ On the server:
 - `NLEVER_HOST` - Server host:port
 - `NLEVER_AUTH` - Authentication token (optional)
 - `NLEVER_HEALTH_CHECK` - Health endpoint path (optional)
+- `NLEVER_EXCLUSIONS` - Custom exclusion patterns, comma-separated (optional, overrides defaults)
 
 ## Requirements
 
@@ -138,4 +152,4 @@ On the server:
 
 ## License
 
-MIT
+MIT.

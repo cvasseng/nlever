@@ -1,8 +1,12 @@
 {
   "name": "nlever",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "type": "module",
   "description": "Zero-dependency Node.js deployment tool",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cvasseng/nlever.git"
+  },
   "bin": {
     "nlever-server": "./nlever-server.mjs",
     "nlever": "./nlever-cli.mjs"

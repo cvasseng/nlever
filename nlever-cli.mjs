@@ -45,16 +45,23 @@ async function createArchive() {
   
   console.log('Creating deployment archive...');
   
+  // Default exclusions
+  let exclusions = ['.git', 'node_modules', '*.log', '.env*'];
+  
+  // Use custom exclusions if specified
+  if (config.NLEVER_EXCLUSIONS) {
+    exclusions = config.NLEVER_EXCLUSIONS.split(',').map(s => s.trim());
+    console.log('Using custom exclusions:', exclusions.join(', '));
+  }
+  
+  const tarArgs = [];
+  exclusions.forEach(pattern => {
+    tarArgs.push(`--exclude=${pattern}`);
+  });
+  tarArgs.push('-czf', archivePath, '.');
+  
   return new Promise((resolve, reject) => {
-    const tar = spawn('tar', [
-      '--exclude=.git',
-      '--exclude=node_modules', 
-      '--exclude=*.log',
-      '--exclude=.env*',
-      '-czf',
-      archivePath,
-      '.'
-    ], { stdio: 'inherit' });
+    const tar = spawn('tar', tarArgs, { stdio: 'inherit' });
     
     tar.on('close', code => {
       if (code === 0) {
@@ -325,10 +332,99 @@ async function destroy() {
   }
 }
 
-async function run() {
-  loadConfig();
+async function init() {
+  let envContent = '';
+  let existingVars = {};
   
+  // Read existing .env file if it exists
+  try {
+    envContent = await fs.readFile(CONFIG_FILE, 'utf8');
+    
+    // Parse existing variables
+    envContent.split('\n').forEach(line => {
+      const match = line.match(/^([A-Z_]+)=/);
+      if (match) {
+        existingVars[match[1]] = true;
+      }
+    });
+  } catch {
+    // No existing .env file
+  }
+  
+  let appName = '';
+  
+  // Try to read app name from package.json
+  try {
+    const packageJson = JSON.parse(await fs.readFile('package.json', 'utf8'));
+    if (packageJson.name) {
+      appName = packageJson.name;
+      console.log(`✓ Found app name from package.json: ${appName}`);
+    }
+  } catch {
+    // No package.json or no name field
+  }
+  
+  const newVars = [];
+  
+  // Add required variables if they don't exist
+  if (!existingVars.NLEVER_NAME) {
+    newVars.push(`NLEVER_NAME=${appName}`);
+  }
+  
+  if (!existingVars.NLEVER_HOST) {
+    newVars.push('NLEVER_HOST=');
+  }
+  
+  // Add optional variables as comments if they don't exist
+  if (!existingVars.NLEVER_AUTH) {
+    newVars.push('# NLEVER_AUTH=your-secret-token       # Optional, must match server');
+  }
+  
+  if (!existingVars.NLEVER_HEALTH_CHECK) {
+    newVars.push('# NLEVER_HEALTH_CHECK=/health         # Optional, endpoint to verify deployment');
+  }
+  
+  if (!existingVars.NLEVER_EXCLUSIONS) {
+    newVars.push('# NLEVER_EXCLUSIONS=.git,node_modules,*.log  # Optional, custom exclusion patterns');
+  }
+  
+  if (newVars.length === 0) {
+    console.log('✓ .env file already has all nlever variables');
+    return;
+  }
+  
+  // Append new variables
+  if (envContent && !envContent.endsWith('\n')) {
+    envContent += '\n';
+  }
+  
+  if (envContent) {
+    envContent += '\n# nlever configuration\n';
+  }
+  
+  envContent += newVars.join('\n') + '\n';
+  
+  await fs.writeFile(CONFIG_FILE, envContent);
+  
+  console.log('✓ Created/updated .env file with nlever configuration');
+  console.log('✗ Remember to set NLEVER_HOST before deploying');
+}
+
+async function run() {
   const command = process.argv[2];
+  
+  // Init doesn't need config loaded
+  if (command === 'init') {
+    try {
+      await init();
+    } catch (error) {
+      console.error('✗ Init failed:', error.message);
+      process.exit(1);
+    }
+    return;
+  }
+  
+  loadConfig();
   
   try {
     switch (command) {
@@ -356,6 +452,7 @@ async function run() {
       default:
         console.log('Usage: nlever <command>');
         console.log('Commands:');
+        console.log('  init      - Initialize .env file with nlever configuration');
         console.log('  push      - Deploy current directory');
         console.log('  rollback  - Rollback to previous version');
         console.log('  status    - Check app status');
