@@ -2,6 +2,26 @@
 
 Zero-dependency Node.js deployment tool. Push code through HTTP to any VM without git hooks, SSH keys, or CI/CD setup. Meant for simple apps in a trusted network.
 
+nlever is considered feature-complete and stable, but is still early in its life.
+
+## Quick Start
+
+Defaults are fairly sensible, so after installing, you should be able to:
+
+```bash
+
+# Install server (requires that pm2 is also installed globally)
+nlever-server --install
+
+# Enable auto-start on boot (one-time setup, requires sudo)
+sudo pm2 startup
+
+# Set up the client
+nlever init # Set up your project (run in your project directory)
+nano .env  # Edit to set your server host for NLEVER_HOST
+nlever push  # Deploy! App will now run on NLEVER_HOST.
+```
+
 ## What's up with the name?
 
 It's a triple-pun: "N" is for Node.js, "lever" as in a simple machine to lift heavy things, as in Norwegian for "lives", and finally as in Norwegian for "deliver".
@@ -23,12 +43,22 @@ On your deployment server:
 # Install and start the nlever server
 nlever-server --install
 
+# Enable auto-start on boot (one-time setup, requires sudo)
+sudo pm2 startup
+
 # Or manually with environment variables
-NLEVER_PORT=8080 \
+NLEVER_PORT=8081 \
 NLEVER_BASE_DIR=/var/www \
 NLEVER_AUTH_TOKEN=your-secret-token \
+NLEVER_PROXY=yes \
+NLEVER_PROXY_PORT=8080 \
 nlever-server --install
+
+# Then enable auto-start
+sudo pm2 startup
 ```
+
+**Important:** The `sudo pm2 startup` command is needed only once per server to enable automatic restart after reboots. Without it, you'll need to manually restart nlever-server after each reboot.
 
 To uninstall:
 ```bash
@@ -51,11 +81,27 @@ Or manually create a `.env` file:
 
 ```env
 NLEVER_NAME=myapp
-NLEVER_HOST=server.lan:8080
+NLEVER_HOST=server.lan:8081
 NLEVER_AUTH=your-secret-token       # Optional, must match server
 NLEVER_HEALTH_CHECK=/health         # Optional, endpoint to verify deployment
 NLEVER_EXCLUSIONS=.git,node_modules,*.log  # Optional, custom exclusion patterns
 ```
+
+### Deployment-Specific Environment Variables
+
+If you need different environment variables for deployment vs development, create a `.env.nlever` file instead of (or alongside) `.env`:
+
+```env
+# .env.nlever - deployment-specific environment
+NODE_ENV=production
+DATABASE_URL=postgres://prod-server/myapp
+API_BASE_URL=https://api.example.com
+```
+
+When `nlever push` runs:
+- If `.env.nlever` exists, it will be renamed to `.env` in the deployment archive
+- Any existing `.env` file will be ignored and excluded from the deployment
+- This allows you to keep separate configs for development (`.env`) and production (`.env.nlever`)
 
 **Main Usage**
 ```bash
@@ -101,6 +147,7 @@ nlever destroy
 - **Health Checks** - Verify deployment success with custom endpoint
 - **Dependency Management** - Automatic npm/yarn install
 - **App Management** - Stop, restart, and destroy commands
+- **Proxy Mode** - Route apps through server paths (e.g., `server.com/myapp`)
 - **Minimal Dependencies** - Only requires Node.js, tar, and PM2
 
 ## Directory Structure
@@ -118,9 +165,108 @@ On the server, the apps are stored as such:
 │       └── 1693847234/    # Current release
 ```
 
+## Proxy Mode
+
+When `NLEVER_PROXY=yes` is set on the server, nlever enables a built-in HTTP proxy that routes requests through server paths:
+
+- **Without proxy** (`NLEVER_PROXY=no`, default): Apps run on their default ports.
+- **With proxy** (`NLEVER_PROXY=yes`): Apps are assigned unique ports and accessible via server paths.
+
+### Separate Ports for Security
+
+Proxy mode runs two separate HTTP servers:
+- **API Server** (`NLEVER_PORT`, default 8081): Handles deployments, management commands - restrict with firewall
+- **Proxy Server** (`NLEVER_PROXY_PORT`, default 8080): Handles public app traffic - open to public
+
+This separation allows you to:
+- Block API port (8081) from public access via firewall rules
+- Keep proxy port (8080) open for public app traffic
+- Use different authentication for each service
+
+### Example with Proxy Mode
+
+With `NLEVER_PORT=8081` and `NLEVER_PROXY_PORT=8080`:
+- **Management**: `http://example.com:8081/deploy/myapp` (restricted)
+- **App Access**: `http://example.com:8080/myapp` (public)
+- Apps automatically receive `PORT=assigned_port` environment variable
+
+### Port Management
+- App ports are assigned starting from 3001 (3001, 3002, 3003...)
+- Port assignments persist across server restarts
+- Destroyed apps free their assigned ports
+
+### Proxy Headers for Apps
+When proxy mode is enabled, applications receive standard proxy headers to help them work correctly behind the proxy:
+
+- `X-Forwarded-Prefix: /{appname}` - The path prefix the app is served under
+- `X-Forwarded-For: <client-ip>` - Original client IP address
+- `X-Real-IP: <client-ip>` - Alternative client IP header (some frameworks prefer this)
+- `X-Forwarded-Proto: http` - Original protocol used by the client
+
+Apps can use these headers to:
+- Build correct absolute URLs using the forwarded prefix
+- Log real client IPs instead of localhost
+- Detect the original protocol for security purposes
+
+**Example usage in an Express app:**
+```javascript
+app.use((req, res, next) => {
+  const basePrefix = req.headers['x-forwarded-prefix'] || '';
+  const clientIP = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  
+  // Use basePrefix for URL generation
+  res.locals.apiUrl = `${basePrefix}/api`;
+  res.locals.assetsUrl = `${basePrefix}/static`;
+  
+  next();
+});
+```
+
+### App Listings and Custom Home Page
+
+When proxy mode is enabled, you can control what appears at the root URL (`/`):
+
+**App Listings (set `NLEVER_APP_LISTINGS=yes`):**
+- **`/`** - Shows HTML page with clickable list of deployed apps
+- **`/app_toc`** - Returns JSON: `{"apps": ["app1", "app2", ...]}`
+
+**Custom Home Page:**
+- Deploy an app named `nlever_home` to completely customize the root page
+- The `nlever_home` app will handle all requests to `/` 
+- JSON endpoint `/app_toc` continues to work for programmatic access
+- This allows you to create custom dashboards, landing pages, or admin interfaces
+
+**No Listings (default):**
+- **`/`** - Returns 404 when `NLEVER_APP_LISTINGS` is set to something other than `yes`
+- Apps are only accessible via their direct URLs (`/myapp`)
+
+## Security Features
+
+### Rate Limiting
+The admin API endpoints are automatically rate limited to **10 requests per minute per IP address**. When exceeded, requests return `429 Too Many Requests`.
+
+### IP Whitelisting
+Control access to nlever services using IP allowlists:
+
+**Admin API Protection:**
+```bash
+# Only allow specific IPs to access deployment/management endpoints
+NLEVER_ADMIN_IPS_ALLOW=192.168.1.10,192.168.1.20,127.0.0.1
+```
+
+**Proxy Protection:**
+```bash
+# Control public app access (use * to allow all)
+NLEVER_PROXY_IPS_ALLOW=*
+# Or restrict to specific networks
+NLEVER_PROXY_IPS_ALLOW=10.0.0.100,10.0.0.101,192.168.1.50
+```
+
+If whitelist variables are not set, all IPs are allowed by default.
+
 ## API Endpoints
 
-These are the endpoints exposed by `nlever-server`:
+These are the management endpoints exposed by `nlever-server`:
 
 - `POST /deploy/:appname?health_check=/health` - Deploy application
 - `POST /rollback/:appname` - Rollback to previous version
@@ -130,12 +276,20 @@ These are the endpoints exposed by `nlever-server`:
 - `GET /status/:appname` - Get PM2 process status
 - `GET /logs/:appname?lines=100` - Get application logs
 
+When proxy mode is enabled, the proxy server (on `NLEVER_PROXY_PORT`) routes:
+- `GET /:appname/*` - Proxy requests to the application
+
 ## Environment Variables
 
 ### Server
-- `NLEVER_PORT` - Server port (default: 8080)
+- `NLEVER_PORT` - API server port (default: 8081)
 - `NLEVER_BASE_DIR` - Base directory for apps (default: /var/www, fallback: ~/nlever-apps)
 - `NLEVER_AUTH_TOKEN` - Bearer token for authentication (optional)
+- `NLEVER_PROXY` - Enable proxy mode: `yes` or `no` (default: no)
+- `NLEVER_PROXY_PORT` - Proxy server port when proxy mode enabled (default: 8080)
+- `NLEVER_APP_LISTINGS` - Enable app listing UI and `/app_toc` JSON endpoint: `yes` or unset (default: unset)
+- `NLEVER_ADMIN_IPS_ALLOW` - Comma-separated IP whitelist for admin API (optional, allows all if unset)
+- `NLEVER_PROXY_IPS_ALLOW` - Comma-separated IP whitelist for proxy server (optional, allows all if unset)
 
 ### Client
 - `NLEVER_NAME` - Application name

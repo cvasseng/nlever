@@ -2,6 +2,7 @@
 
 // nlever: A CLI tool to deploy and manage Node.js applications on a remote server.
 // Chris Vasseng <hello@vasseng.com>
+// https://github.com/cvasseng/nlever
 // Licensed under the MIT License.
 
 import { promises as fs } from 'fs';
@@ -58,6 +59,17 @@ async function createArchive() {
   exclusions.forEach(pattern => {
     tarArgs.push(`--exclude=${pattern}`);
   });
+  
+  // Check if .env.nlever exists - if so, rename it to .env and exclude existing .env
+  try {
+    await fs.access('.env.nlever');
+    tarArgs.push('--transform', 's/.env.nlever$/.env/');
+    tarArgs.push('--exclude=.env');
+    console.log('Using .env.nlever as .env in deployment (excluding any existing .env)');
+  } catch {
+    // .env.nlever doesn't exist, no-op
+  }
+  
   tarArgs.push('-czf', archivePath, '.');
   
   return new Promise((resolve, reject) => {
@@ -210,125 +222,101 @@ async function push() {
 }
 
 async function rollback() {
-  try {
-    const { statusCode, body } = await httpRequest('POST', `/rollback/${config.NLEVER_NAME}`);
-    
-    if (statusCode === 200) {
-      console.log('✓ Rollback successful');
-    } else {
-      try {
-        const error = JSON.parse(body);
-        console.error(`✗ Rollback failed: ${error.error}`);
-      } catch {
-        console.error(`✗ Rollback failed with status ${statusCode}`);
-      }
-      throw new Error('Rollback failed');
+  const { statusCode, body } = await httpRequest('POST', `/rollback/${config.NLEVER_NAME}`);
+  
+  if (statusCode === 200) {
+    console.log('✓ Rollback successful');
+  } else {
+    try {
+      const error = JSON.parse(body);
+      console.error(`✗ Rollback failed: ${error.error}`);
+    } catch {
+      console.error(`✗ Rollback failed with status ${statusCode}`);
     }
-  } catch (error) {
-    throw error;
+    throw new Error('Rollback failed');
   }
 }
 
 async function status() {
-  try {
-    const { statusCode, body } = await httpRequest('GET', `/status/${config.NLEVER_NAME}`);
-    
-    if (statusCode === 200) {
-      const status = JSON.parse(body);
-      console.log(`App: ${status.name}`);
-      console.log(`Status: ${status.pm2.status}`);
-      console.log(`CPU: ${status.pm2.cpu}%`);
-      console.log(`Memory: ${Math.round(status.pm2.memory / 1024 / 1024)} MB`);
-      console.log(`Uptime: ${new Date(status.pm2.uptime).toISOString()}`);
-      console.log(`Restarts: ${status.pm2.restarts}`);
-    } else {
-      try {
-        const error = JSON.parse(body);
-        console.error(`✗ ${error.error}`);
-      } catch {
-        console.error(`✗ Failed with status ${statusCode}`);
-      }
-      throw new Error('Status check failed');
+  const { statusCode, body } = await httpRequest('GET', `/status/${config.NLEVER_NAME}`);
+  
+  if (statusCode === 200) {
+    const status = JSON.parse(body);
+    console.log(`App: ${status.name}`);
+    console.log(`Status: ${status.pm2.status}`);
+    console.log(`CPU: ${status.pm2.cpu}%`);
+    console.log(`Memory: ${Math.round(status.pm2.memory / 1024 / 1024)} MB`);
+    console.log(`Uptime: ${new Date(status.pm2.uptime).toISOString()}`);
+    console.log(`Restarts: ${status.pm2.restarts}`);
+  } else {
+    try {
+      const error = JSON.parse(body);
+      console.error(`✗ ${error.error}`);
+    } catch {
+      console.error(`✗ Failed with status ${statusCode}`);
     }
-  } catch (error) {
-    throw error;
+    throw new Error('Status check failed');
   }
 }
 
 async function logs() {
   const lines = process.argv[3] || '100';
   
-  try {
-    const { statusCode } = await httpRequest('GET', `/logs/${config.NLEVER_NAME}?lines=${lines}`, {
-      pipe: process.stdout
-    });
-    
-    if (statusCode !== 200) {
-      console.error(`\n✗ Failed to get logs with status ${statusCode}`);
-      throw new Error('Failed to get logs');
-    }
-  } catch (error) {
-    throw error;
+  const { statusCode } = await httpRequest('GET', `/logs/${config.NLEVER_NAME}?lines=${lines}`, {
+    pipe: process.stdout
+  });
+  
+  if (statusCode !== 200) {
+    console.error(`\n✗ Failed to get logs with status ${statusCode}`);
+    throw new Error('Failed to get logs');
   }
 }
 
 async function stop() {
-  try {
-    const { statusCode, body } = await httpRequest('POST', `/stop/${config.NLEVER_NAME}`);
-    
-    if (statusCode === 200) {
-      console.log('✓ App stopped successfully');
-    } else {
-      try {
-        const error = JSON.parse(body);
-        console.error(`✗ Stop failed: ${error.error}`);
-      } catch {
-        console.error(`✗ Stop failed with status ${statusCode}`);
-      }
-      throw new Error('Stop failed');
+  const { statusCode, body } = await httpRequest('POST', `/stop/${config.NLEVER_NAME}`);
+  
+  if (statusCode === 200) {
+    console.log('✓ App stopped successfully');
+  } else {
+    try {
+      const error = JSON.parse(body);
+      console.error(`✗ Stop failed: ${error.error}`);
+    } catch {
+      console.error(`✗ Stop failed with status ${statusCode}`);
     }
-  } catch (error) {
-    throw error;
+    throw new Error('Stop failed');
   }
 }
 
 async function restart() {
-  try {
-    const { statusCode, body } = await httpRequest('POST', `/restart/${config.NLEVER_NAME}`);
-    
-    if (statusCode === 200) {
-      console.log('✓ App restarted successfully');
-    } else {
-      try {
-        const error = JSON.parse(body);
-        console.error(`✗ Restart failed: ${error.error}`);
-      } catch {
-        console.error(`✗ Restart failed with status ${statusCode}`);
-      }
-      throw new Error('Restart failed');
+  const { statusCode, body } = await httpRequest('POST', `/restart/${config.NLEVER_NAME}`);
+  
+  if (statusCode === 200) {
+    console.log('✓ App restarted successfully');
+  } else {
+    try {
+      const error = JSON.parse(body);
+      console.error(`✗ Restart failed: ${error.error}`);
+    } catch {
+      console.error(`✗ Restart failed with status ${statusCode}`);
     }
-  } catch (error) {
-    throw error;
+    throw new Error('Restart failed');
   }
 }
 
 async function destroy() {
-  try {
-    const { statusCode, body } = await httpRequest('POST', `/destroy/${config.NLEVER_NAME}`);
-    
-    if (statusCode === 200) {
-      console.log('✓ App destroyed successfully');
-    } else {
-      try {
-        const error = JSON.parse(body);
-        console.error(`✗ Destroy failed: ${error.error}`);
-      } catch {
-        console.error(`✗ Destroy failed with status ${statusCode}`);
-      }
-      throw new Error('Destroy failed');
+  const { statusCode, body } = await httpRequest('POST', `/destroy/${config.NLEVER_NAME}`);
+  
+  if (statusCode === 200) {
+    console.log('✓ App destroyed successfully');
+  } else {
+    try {
+      const error = JSON.parse(body);
+      console.error(`✗ Destroy failed: ${error.error}`);
+    } catch {
+      console.error(`✗ Destroy failed with status ${statusCode}`);
     }
-  } catch (error) {
-    throw error;
+    throw new Error('Destroy failed');
   }
 }
 

@@ -2,9 +2,10 @@
 
 // nlever: A CLI tool to deploy and manage Node.js applications on a remote server.
 // Chris Vasseng <hello@vasseng.com>
+// https://github.com/cvasseng/nlever
 // Licensed under the MIT License.
 
-import { createServer } from 'http';
+import { createServer, request } from 'http';
 import { promises as fs } from 'fs';
 import { join } from 'path';
 import { execSync, spawn } from 'child_process';
@@ -12,12 +13,18 @@ import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import { tmpdir } from 'os';
 
-const PORT = process.env.NLEVER_PORT || 8080;
-const BASE_DIR = process.env.NLEVER_BASE_DIR || '/var/www';
+const PORT = process.env.NLEVER_PORT || 8081;
+let BASE_DIR = process.env.NLEVER_BASE_DIR || '/var/www';
 const AUTH_TOKEN = process.env.NLEVER_AUTH_TOKEN;
+const PROXY_MODE = process.env.NLEVER_PROXY === 'yes';
+const PROXY_PORT = process.env.NLEVER_PROXY_PORT || (PROXY_MODE ? 8080 : null);
+const APP_LISTINGS = process.env.NLEVER_APP_LISTINGS !== 'no';
+const ADMIN_IPS = process.env.NLEVER_ADMIN_IPS_ALLOW;
+const PROXY_IPS = process.env.NLEVER_PROXY_IPS_ALLOW;
 
 let apps = {};
-const REGISTRY_FILE = join(BASE_DIR, '.nlever-apps.json');
+let REGISTRY_FILE = join(BASE_DIR, '.nlever-apps.json');
+const rateLimitMap = new Map(); // IP -> {count, lastReset}
 
 async function loadRegistry() {
   try {
@@ -39,50 +46,109 @@ function checkAuth(req) {
   return header && header === `Bearer ${AUTH_TOKEN}`;
 }
 
-function parsepm2Status(status) {
-  const lines = status.split('\n');
-  const info = {
-    pm2_env: { status: 'unknown', pm_uptime: Date.now(), restart_time: 0 },
-    monit: { cpu: 0, memory: 0 }
-  };
+function sendError(res, statusCode, message) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: message }));
+}
+
+function getClientIP(req) {
+  let ip = req.connection.remoteAddress || req.socket.remoteAddress || '127.0.0.1';
+  // Handle IPv6-mapped IPv4 addresses
+  if (ip.startsWith('::ffff:')) {
+    ip = ip.substring(7);
+  }
+  return ip;
+}
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
   
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.includes('status')) {
-      const match = trimmed.match(/status\s*[│|]\s*(\w+)/);
-      if (match) info.pm2_env.status = match[1];
-    } else if (trimmed.includes('cpu')) {
-      const match = trimmed.match(/(\d+(?:\.\d+)?)%/);
-      if (match) info.monit.cpu = parseFloat(match[1]);
-    } else if (trimmed.includes('memory')) {
-      const match = trimmed.match(/(\d+(?:\.\d+)?)\s*(kb|mb|gb)/i);
-      if (match) {
-        let mem = parseFloat(match[1]);
-        const unit = match[2].toLowerCase();
-        if (unit === 'kb') mem *= 1024;
-        else if (unit === 'mb') mem *= 1024 * 1024;
-        else if (unit === 'gb') mem *= 1024 * 1024 * 1024;
-        info.monit.memory = mem;
-      }
-    } else if (trimmed.includes('restarts')) {
-      const match = trimmed.match(/(\d+)/);
-      if (match) info.pm2_env.restart_time = parseInt(match[1]);
-    }
+  if (!entry || now - entry.lastReset > 60000) {
+    // First request or reset window (1 minute)
+    rateLimitMap.set(ip, { count: 1, lastReset: now });
+    return true;
   }
   
-  return info;
+  if (entry.count >= 10) {
+    // Rate limit exceeded (10 requests per minute)
+    return false;
+  }
+  
+  entry.count++;
+  return true;
+}
+
+function checkIPWhitelist(ip, whitelist) {
+  if (!whitelist) return true; // No whitelist configured, allow all
+  
+  if (whitelist === '*') return true; // Wildcard allows all
+  
+  const allowedIPs = whitelist.split(',').map(ip => ip.trim());
+  return allowedIPs.includes(ip);
+}
+
+function getAppPaths(appName, timestamp = null) {
+  const base = join(BASE_DIR, appName);
+  const paths = {
+    base,
+    current: join(base, 'current'),
+    previous: join(base, 'previous'),
+    releases: join(base, 'releases'),
+    lock: join(base, '.nlever-deploying'),
+    pm2Config: join(base, 'pm2.config.json')
+  };
+  
+  if (timestamp) {
+    paths.release = join(paths.releases, timestamp.toString());
+  }
+  
+  return paths;
+}
+
+
+function getPM2ProcessInfo(pm2Name) {
+  try {
+    const output = execSync('pm2 jlist', { encoding: 'utf8' });
+    const processes = JSON.parse(output);
+    
+    const process = processes.find(p => p.name === pm2Name);
+    if (!process) {
+      return {
+        pm2_env: { status: 'stopped', pm_uptime: Date.now(), restart_time: 0 },
+        monit: { cpu: 0, memory: 0 }
+      };
+    }
+    
+    return {
+      pm2_env: {
+        status: process.pm2_env.status,
+        pm_uptime: process.pm2_env.pm_uptime || Date.now(),
+        restart_time: process.pm2_env.restart_time || 0
+      },
+      monit: {
+        cpu: process.monit.cpu || 0,
+        memory: process.monit.memory || 0
+      }
+    };
+  } catch {
+    return {
+      pm2_env: { status: 'unknown', pm_uptime: Date.now(), restart_time: 0 },
+      monit: { cpu: 0, memory: 0 }
+    };
+  }
 }
 
 async function acquireLock(appName) {
-  const lockFile = join(BASE_DIR, appName, '.nlever-deploying');
+  const paths = getAppPaths(appName);
   try {
-    await fs.mkdir(join(BASE_DIR, appName), { recursive: true });
+    await fs.mkdir(paths.base, { recursive: true });
     
     try {
-      const stat = await fs.stat(lockFile);
+      const stat = await fs.stat(paths.lock);
       const lockAge = Date.now() - stat.mtime.getTime();
       if (lockAge > 600000) { // 10 minutes
-        await fs.unlink(lockFile);
+        await fs.unlink(paths.lock);
       } else {
         throw new Error('Deployment already in progress');
       }
@@ -90,17 +156,31 @@ async function acquireLock(appName) {
       if (e.code !== 'ENOENT') throw e;
     }
     
-    await fs.writeFile(lockFile, Date.now().toString());
+    await fs.writeFile(paths.lock, Date.now().toString());
   } catch (error) {
     throw error;
   }
 }
 
 async function releaseLock(appName) {
-  const lockFile = join(BASE_DIR, appName, '.nlever-deploying');
+  const paths = getAppPaths(appName);
   try {
-    await fs.unlink(lockFile);
+    await fs.unlink(paths.lock);
   } catch {}
+}
+
+function getAppPort(appName) {
+  if (!PROXY_MODE) return 8080; // Default port when not in proxy mode
+  
+  if (apps[appName]?.port) {
+    return apps[appName].port;
+  }
+  
+  // Simple port allocation starting from 3001
+  const usedPorts = Object.values(apps).map(app => app.port).filter(Boolean);
+  let port = 3001;
+  while (usedPorts.includes(port)) port++;
+  return port;
 }
 
 async function deploy(req, res, appName) {
@@ -114,11 +194,10 @@ async function deploy(req, res, appName) {
     const healthCheck = url.searchParams.get('health_check');
     
     const timestamp = Date.now();
-    const releaseDir = join(BASE_DIR, appName, 'releases', timestamp.toString());
-    const currentLink = join(BASE_DIR, appName, 'current');
-    previousLink = join(BASE_DIR, appName, 'previous');
+    const paths = getAppPaths(appName, timestamp);
+    previousLink = paths.previous;
     
-    await fs.mkdir(releaseDir, { recursive: true });
+    await fs.mkdir(paths.release, { recursive: true });
     
     const tempFile = join(tmpdir(), `nlever-${appName}-${timestamp}.tar.gz`);
     
@@ -126,7 +205,7 @@ async function deploy(req, res, appName) {
     await pipeline(req, fileStream);
 
     await new Promise((resolve, reject) => {
-      const extract = spawn('tar', ['-xzf', tempFile, '-C', releaseDir], {
+      const extract = spawn('tar', ['-xzf', tempFile, '-C', paths.release], {
         timeout: 60000
       });
       extract.on('close', code => code === 0 ? resolve() : reject(new Error(`tar failed: ${code}`)));
@@ -135,29 +214,29 @@ async function deploy(req, res, appName) {
 
     await fs.unlink(tempFile);
     
-    const extractedFiles = await fs.readdir(releaseDir);
-    console.log(`Extracted files to ${releaseDir}:`, extractedFiles.slice(0, 10));
+    const extractedFiles = await fs.readdir(paths.release);
+    console.log(`Extracted files to ${paths.release}:`, extractedFiles.slice(0, 10));
 
     let currentTarget = null;
     try {
-      currentTarget = await fs.readlink(currentLink);
+      currentTarget = await fs.readlink(paths.current);
     } catch {}
 
     if (currentTarget) {
       try {
-        await fs.unlink(previousLink);
+        await fs.unlink(paths.previous);
       } catch {}
-      await fs.symlink(currentTarget, previousLink);
+      await fs.symlink(currentTarget, paths.previous);
     }
 
     try {
-      await fs.unlink(currentLink);
+      await fs.unlink(paths.current);
     } catch {}
-    await fs.symlink(releaseDir, currentLink);
+    await fs.symlink(paths.release, paths.current);
 
-    const packageJsonPath = join(releaseDir, 'package.json');
+    const packageJsonPath = join(paths.release, 'package.json');
     
-    const filteredEnv = {
+    const pm2Env = {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
       USER: process.env.USER,
@@ -165,10 +244,14 @@ async function deploy(req, res, appName) {
       LANG: process.env.LANG || 'en_US.UTF-8'
     };
     
+    if (PROXY_MODE) {
+      pm2Env.PORT = getAppPort(appName).toString();
+    }
+
     let pm2Config = {
       name: `nlever-${appName}`,
-      cwd: currentLink,
-      env: filteredEnv
+      cwd: paths.current,
+      env: pm2Env
     };
     
     try {
@@ -202,7 +285,7 @@ async function deploy(req, res, appName) {
       
       let installCmd = 'npm install';
       try {
-        await fs.access(join(releaseDir, 'yarn.lock'));
+        await fs.access(join(paths.release, 'yarn.lock'));
         installCmd = 'yarn install --frozen-lockfile';
         console.log('Found yarn.lock, using yarn');
       } catch {
@@ -210,7 +293,7 @@ async function deploy(req, res, appName) {
       }
       
       execSync(installCmd, { 
-        cwd: releaseDir, 
+        cwd: paths.release, 
         timeout: 300000,
         stdio: ['ignore', 'pipe', 'pipe']
       });
@@ -219,22 +302,19 @@ async function deploy(req, res, appName) {
       console.log(`Skipping dependency installation for ${appName}:`, err.message);
     }
 
-    const pm2Name = `nlever-${appName}`;
-    
     try {
-      execSync(`pm2 describe ${pm2Name}`, { stdio: 'ignore' });
-      console.log(`Restarting existing PM2 app: ${pm2Name}`);
-      execSync(`pm2 restart ${pm2Name} --update-env`, { timeout: 30000 });
+      execSync(`pm2 describe nlever-${appName}`, { stdio: 'ignore' });
+      console.log(`Restarting existing PM2 app: nlever-${appName}`);
+      execSync(`pm2 restart nlever-${appName} --update-env`, { timeout: 30000 });
     } catch {
-      const configFile = join(BASE_DIR, appName, 'pm2.config.json');
-      console.log(`Starting new PM2 app ${pm2Name} with config:`, JSON.stringify(pm2Config, null, 2));
-      await fs.writeFile(configFile, JSON.stringify({ apps: [pm2Config] }, null, 2));
+      console.log(`Starting new PM2 app nlever-${appName} with config:`, JSON.stringify(pm2Config, null, 2));
+      await fs.writeFile(paths.pm2Config, JSON.stringify({ apps: [pm2Config] }, null, 2));
       
       try {
-        const result = execSync(`pm2 start ${configFile}`, { timeout: 30000, encoding: 'utf8' });
+        const result = execSync(`pm2 start ${paths.pm2Config}`, { timeout: 30000, encoding: 'utf8' });
         console.log(`PM2 start output:`, result);
       } catch (e) {
-        console.error(`PM2 start failed for ${pm2Name}:`, e.message);
+        console.error(`PM2 start failed for nlever-${appName}:`, e.message);
         if (e.stdout) console.error('Stdout:', e.stdout.toString());
         if (e.stderr) console.error('Stderr:', e.stderr.toString());
         throw new Error(`PM2 start failed: ${e.message}`);
@@ -243,17 +323,18 @@ async function deploy(req, res, appName) {
 
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    console.log(`Checking PM2 status for ${pm2Name}...`);
+    console.log(`Checking PM2 status for nlever-${appName}...`);
     try {
-      const describeOutput = execSync(`pm2 describe ${pm2Name}`, { encoding: 'utf8' });
-      console.log(`PM2 describe succeeded for ${pm2Name}`);
+      execSync(`pm2 describe nlever-${appName}`, { encoding: 'utf8' });
+      console.log(`PM2 describe succeeded for nlever-${appName}`);
     } catch (err) {
-      console.error(`PM2 describe failed for ${pm2Name}:`, err.message);
+      console.error(`PM2 describe failed for nlever-${appName}:`, err.message);
       rollbackNeeded = true;
       throw new Error('PM2 process failed to start');
     }
 
     if (healthCheck) {
+      const assignedPort = getAppPort(appName);
       const maxAttempts = 10;
       const delays = [1000, 2000, 4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000];
       let healthy = false;
@@ -262,11 +343,10 @@ async function deploy(req, res, appName) {
         await new Promise(resolve => setTimeout(resolve, delays[i]));
         
         try {
-          const port = 3000; // Default port
           const healthRes = await new Promise((resolve, reject) => {
-            const req = createServer().request({
+            const req = request({
               hostname: 'localhost',
-              port,
+              port: assignedPort,
               path: healthCheck,
               method: 'GET',
               timeout: 5000
@@ -290,19 +370,19 @@ async function deploy(req, res, appName) {
     }
 
     // Cleanup old releases
-    const releasesDir = join(BASE_DIR, appName, 'releases');
-    const releases = await fs.readdir(releasesDir);
+    const releases = await fs.readdir(paths.releases);
     for (const release of releases) {
       if (release !== timestamp.toString()) {
-        const oldRelease = join(releasesDir, release);
+        const oldRelease = join(paths.releases, release);
         await fs.rm(oldRelease, { recursive: true, force: true });
       }
     }
 
     apps[appName] = {
       lastDeploy: timestamp,
-      pm2Name,
-      healthCheck
+      pm2Name: `nlever-${appName}`,
+      healthCheck,
+      ...(PROXY_MODE && { port: getAppPort(appName) })
     };
     await saveRegistry();
 
@@ -316,52 +396,46 @@ async function deploy(req, res, appName) {
   } catch (error) {
     if (rollbackNeeded && previousLink) {
       try {
+        const rollbackPaths = getAppPaths(appName);
         const previousTarget = await fs.readlink(previousLink);
-        await fs.unlink(join(BASE_DIR, appName, 'current'));
-        await fs.symlink(previousTarget, join(BASE_DIR, appName, 'current'));
+        await fs.unlink(rollbackPaths.current);
+        await fs.symlink(previousTarget, rollbackPaths.current);
         
-        const pm2Name = `nlever-${appName}`;
-        execSync(`pm2 restart ${pm2Name} --update-env`, { timeout: 30000 });
+        execSync(`pm2 restart nlever-${appName} --update-env`, { timeout: 30000 });
       } catch {}
     }
 
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: error.message }));
+    sendError(res, 500, error.message);
   } finally {
     await releaseLock(appName);
   }
 }
 
 async function rollback(req, res, appName) {
-  const previousLink = join(BASE_DIR, appName, 'previous');
-  const currentLink = join(BASE_DIR, appName, 'current');
+  const paths = getAppPaths(appName);
   
   try {
-    const previousTarget = await fs.readlink(previousLink);
-    const currentTarget = await fs.readlink(currentLink);
+    const previousTarget = await fs.readlink(paths.previous);
+    const currentTarget = await fs.readlink(paths.current);
     
-    await fs.unlink(currentLink);
-    await fs.symlink(previousTarget, currentLink);
+    await fs.unlink(paths.current);
+    await fs.symlink(previousTarget, paths.current);
     
-    await fs.unlink(previousLink);
-    await fs.symlink(currentTarget, previousLink);
+    await fs.unlink(paths.previous);
+    await fs.symlink(currentTarget, paths.previous);
     
-    const pm2Name = `nlever-${appName}`;
-    execSync(`pm2 restart ${pm2Name} --update-env`, { timeout: 30000 });
+    execSync(`pm2 restart nlever-${appName} --update-env`, { timeout: 30000 });
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'Rollback successful' }));
   } catch (error) {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'No previous version to rollback to' }));
+    sendError(res, 404, 'No previous version to rollback to');
   }
 }
 
 async function getStatus(req, res, appName) {
   try {
-    const pm2Name = `nlever-${appName}`;
-    const status = execSync(`pm2 describe ${pm2Name}`, { encoding: 'utf8' });
-    const info = parsepm2Status(status);
+    const info = getPM2ProcessInfo(`nlever-${appName}`);
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -375,8 +449,7 @@ async function getStatus(req, res, appName) {
       }
     }));
   } catch {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'App not found' }));
+    sendError(res, 404, 'App not found');
   }
 }
 
@@ -385,8 +458,7 @@ async function getLogs(req, res, appName) {
     const url = new URL(`http://localhost${req.url}`);
     const lines = url.searchParams.get('lines') || '100';
     
-    const pm2Name = `nlever-${appName}`;
-    const logs = execSync(`pm2 logs ${pm2Name} --nostream --lines ${lines}`, { 
+    const logs = execSync(`pm2 logs nlever-${appName} --nostream --lines ${lines}`, { 
       encoding: 'utf8',
       timeout: 5000
     });
@@ -394,48 +466,41 @@ async function getLogs(req, res, appName) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end(logs);
   } catch {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'App not found' }));
+    sendError(res, 404, 'App not found');
   }
 }
 
 async function stopApp(req, res, appName) {
   try {
-    const pm2Name = `nlever-${appName}`;
-    execSync(`pm2 stop ${pm2Name}`, { timeout: 30000 });
+    execSync(`pm2 stop nlever-${appName}`, { timeout: 30000 });
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'App stopped successfully' }));
   } catch {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'App not found or failed to stop' }));
+    sendError(res, 404, 'App not found or failed to stop');
   }
 }
 
 async function restartApp(req, res, appName) {
   try {
-    const pm2Name = `nlever-${appName}`;
-    execSync(`pm2 restart ${pm2Name}`, { timeout: 30000 });
+    execSync(`pm2 restart nlever-${appName}`, { timeout: 30000 });
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'App restarted successfully' }));
   } catch {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'App not found or failed to restart' }));
+    sendError(res, 404, 'App not found or failed to restart');
   }
 }
 
 async function destroyApp(req, res, appName) {
   try {
-    const pm2Name = `nlever-${appName}`;
-    
     try {
-      execSync(`pm2 delete ${pm2Name}`, { timeout: 30000 });
+      execSync(`pm2 delete nlever-${appName}`, { timeout: 30000 });
     } catch {}
     
-    const appDir = join(BASE_DIR, appName);
+    const paths = getAppPaths(appName);
     try {
-      await fs.rm(appDir, { recursive: true, force: true });
+      await fs.rm(paths.base, { recursive: true, force: true });
     } catch {}
     
     delete apps[appName];
@@ -444,15 +509,68 @@ async function destroyApp(req, res, appName) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'App destroyed successfully' }));
   } catch (error) {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Failed to destroy app' }));
+    sendError(res, 500, 'Failed to destroy app');
   }
 }
 
-async function handleRequest(req, res) {
+async function proxyRequest(req, res, appName, proxyPath) {
+  const app = apps[appName];
+  if (!app || !app.port) {
+    sendError(res, 404, 'App not found or not in proxy mode');
+    return;
+  }
+
+  try {
+    const proxyReq = request({
+      hostname: 'localhost',
+      port: app.port,
+      path: proxyPath,
+      method: req.method,
+      headers: {
+        ...req.headers,
+        host: `localhost:${app.port}`,
+        'x-forwarded-prefix': `/${appName}`,
+        'x-forwarded-for': req.connection.remoteAddress || req.socket.remoteAddress,
+        'x-real-ip': req.connection.remoteAddress || req.socket.remoteAddress,
+        'x-forwarded-proto': 'http'
+      }
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error(`Proxy error for ${appName}:`, err.message);
+      if (!res.headersSent) {
+        sendError(res, 502, 'Proxy target unreachable');
+      }
+    });
+
+    proxyReq.on('response', (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+
+    req.pipe(proxyReq);
+  } catch (error) {
+    sendError(res, 500, 'Proxy error');
+  }
+}
+
+async function handleApiRequest(req, res) {
+  const clientIP = getClientIP(req);
+  
+  // Check IP whitelist first
+  if (!checkIPWhitelist(clientIP, ADMIN_IPS)) {
+    sendError(res, 403, 'Forbidden');
+    return;
+  }
+  
+  // Check rate limit
+  if (!checkRateLimit(clientIP)) {
+    sendError(res, 429, 'Too Many Requests');
+    return;
+  }
+  
   if (!checkAuth(req)) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    sendError(res, 401, 'Unauthorized');
     return;
   }
 
@@ -460,8 +578,7 @@ async function handleRequest(req, res) {
   const [action, appName] = urlParts;
 
   if (!appName || !action) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid request' }));
+    sendError(res, 400, 'Invalid request');
     return;
   }
 
@@ -481,12 +598,69 @@ async function handleRequest(req, res) {
     } else if (req.method === 'GET' && action === 'logs') {
       await getLogs(req, res, appName);
     } else {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found' }));
+      sendError(res, 404, 'Not found');
     }
   } catch (error) {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: error.message }));
+    sendError(res, 500, error.message);
+  }
+}
+
+async function handleProxyRequest(req, res) {
+  const clientIP = getClientIP(req);
+  
+  // Check IP whitelist for proxy
+  if (!checkIPWhitelist(clientIP, PROXY_IPS)) {
+    sendError(res, 403, 'Forbidden');
+    return;
+  }
+
+  const fullUrl = req.url.split('?')[0];
+  const urlParts = fullUrl.split('/').filter(Boolean);
+  
+  if (urlParts.length === 0) {
+    if (apps['nlever_home']) {
+      await proxyRequest(req, res, 'nlever_home', '/');
+      return;
+    }
+    
+    if (APP_LISTINGS) {
+      // Root path - show app listing
+      const appList = Object.keys(apps).map(name => 
+        `<li><a href="/${name}/">${name}</a></li>`
+      ).join('');
+      
+      const html = `<!DOCTYPE html>
+<html><head><title>nlever app listing</title></head>
+<body><h1>Deployed Apps</h1><ul>${appList}</ul></body></html>`;
+      
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(html);
+    } else {
+      sendError(res, 404, 'Not found');
+    }
+    return;
+  }
+
+  // Special route for JSON app listing
+  if (urlParts.length === 1 && urlParts[0] === 'app_toc') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ apps: Object.keys(apps) }));
+    return;
+  }
+
+  const [appName] = urlParts;
+  
+  if (!apps[appName]) {
+    sendError(res, 404, 'App not found');
+    return;
+  }
+
+  const proxyPath = '/' + urlParts.slice(1).join('/') + (req.url.includes('?') ? '?' + req.url.split('?')[1] : '');
+  
+  try {
+    await proxyRequest(req, res, appName, proxyPath);
+  } catch (error) {
+    sendError(res, 500, error.message);
   }
 }
 
@@ -510,12 +684,18 @@ async function install() {
     
     execSync(`pm2 start ${configFile}`, { stdio: 'inherit' });
     execSync('pm2 save', { stdio: 'inherit' });
-    execSync('pm2 startup', { stdio: 'inherit' });
+    
+    try {
+      execSync('pm2 startup', { stdio: 'inherit' });
+      console.log('✓ PM2 startup script created');
+    } catch {
+      console.log('⚠ PM2 startup script creation failed (requires root privileges)');
+      console.log('  Run "sudo pm2 startup" once for auto-start on boot');
+    }
     
     await fs.unlink(configFile);
     
     console.log('✓ nlever-server installed and started with PM2');
-    console.log('✓ PM2 startup script created');
     console.log(`✓ Server running on port ${PORT}`);
   } catch (error) {
     console.error('✗ Installation failed:', error.message);
@@ -537,20 +717,38 @@ async function uninstall() {
 // Check write permissions and fallback if needed
 async function init() {
   try {
+    // Try to create the directory first, then test write access
+    await fs.mkdir(BASE_DIR, { recursive: true });
     await fs.access(BASE_DIR, fs.constants.W_OK);
   } catch {
-    console.log(`No write access to ${BASE_DIR}, using ~/nlever-apps`);
-    process.env.NLEVER_BASE_DIR = join(process.env.HOME, 'nlever-apps');
+    console.log(`Cannot create or write to ${BASE_DIR}, using ~/nlever-apps`);
+    BASE_DIR = join(process.env.HOME, 'nlever-apps');
+    process.env.NLEVER_BASE_DIR = BASE_DIR;
+    REGISTRY_FILE = join(BASE_DIR, '.nlever-apps.json');
   }
   
   await loadRegistry();
   
-  const server = createServer(handleRequest);
-  server.listen(PORT, () => {
-    console.log(`nlever server listening on port ${PORT}`);
+  // API server (always runs)
+  const apiServer = createServer(handleApiRequest);
+  apiServer.listen(PORT, () => {
+    console.log(`nlever API server listening on port ${PORT}`);
     console.log(`Base directory: ${process.env.NLEVER_BASE_DIR || BASE_DIR}`);
     console.log(`Auth: ${AUTH_TOKEN ? 'Enabled' : 'Disabled'}`);
+    console.log(`Proxy mode: ${PROXY_MODE ? 'Enabled' : 'Disabled'}`);
+    
+    if (PROXY_MODE && PROXY_PORT) {
+      console.log(`Proxy server will listen on port ${PROXY_PORT}`);
+    }
   });
+  
+  // Proxy server (only when proxy mode is enabled)
+  if (PROXY_MODE && PROXY_PORT) {
+    const proxyServer = createServer(handleProxyRequest);
+    proxyServer.listen(PROXY_PORT, () => {
+      console.log(`nlever proxy server listening on port ${PROXY_PORT}`);
+    });
+  }
 }
 
 // Handle command line arguments
