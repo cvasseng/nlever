@@ -88,6 +88,19 @@ function checkIPWhitelist(ip, whitelist) {
   return allowedIPs.includes(ip);
 }
 
+function sanitizeAppName(appName) {
+  // Only allow alphanumeric, hyphens, underscores
+  if (!/^[a-zA-Z0-9_-]+$/.test(appName)) {
+    throw new Error('Invalid app name format');
+  }
+  return appName;
+}
+
+function sanitizeForLog(input) {
+  // Remove control characters, newlines, etc.
+  return String(input).replace(/[\r\n\t\x00-\x1f\x7f-\x9f]/g, '');
+}
+
 function getAppPaths(appName, timestamp = null) {
   const base = join(BASE_DIR, appName);
   const paths = {
@@ -188,13 +201,14 @@ async function deploy(req, res, appName) {
   let previousLink = null;
   
   try {
-    await acquireLock(appName);
+    const safeAppName = sanitizeAppName(appName);
+    await acquireLock(safeAppName);
     
     const url = new URL(`http://localhost${req.url}`);
     const healthCheck = url.searchParams.get('health_check');
     
     const timestamp = Date.now();
-    const paths = getAppPaths(appName, timestamp);
+    const paths = getAppPaths(safeAppName, timestamp);
     previousLink = paths.previous;
     
     await fs.mkdir(paths.release, { recursive: true });
@@ -215,7 +229,7 @@ async function deploy(req, res, appName) {
     await fs.unlink(tempFile);
     
     const extractedFiles = await fs.readdir(paths.release);
-    console.log(`Extracted files to ${paths.release}:`, extractedFiles.slice(0, 10));
+    console.log(`Extracted files to ${sanitizeForLog(paths.release)}:`, extractedFiles.slice(0, 10).map(sanitizeForLog));
 
     let currentTarget = null;
     try {
@@ -245,18 +259,18 @@ async function deploy(req, res, appName) {
     };
     
     if (PROXY_MODE) {
-      pm2Env.PORT = getAppPort(appName).toString();
+      pm2Env.PORT = assignedPort.toString();
     }
 
     let pm2Config = {
-      name: `nlever-${appName}`,
+      name: `nlever-${safeAppName}`,
       cwd: paths.current,
       env: pm2Env
     };
     
     try {
       const pkg = JSON.parse(await fs.readFile(packageJsonPath, 'utf8'));
-      console.log(`Found package.json for ${appName}:`, JSON.stringify({
+      console.log(`Found package.json for ${sanitizeForLog(safeAppName)}:`, JSON.stringify({
         name: pkg.name,
         main: pkg.main,
         scripts: pkg.scripts
@@ -265,23 +279,23 @@ async function deploy(req, res, appName) {
       if (pkg.scripts?.start) {
         pm2Config.script = 'npm';
         pm2Config.args = ['run', 'start'];
-        console.log(`Using npm run start for ${appName}`);
+        console.log(`Using npm run start for ${sanitizeForLog(safeAppName)}`);
       } else if (pkg.main) {
         pm2Config.script = pkg.main;
-        console.log(`Using main entry point: ${pkg.main} for ${appName}`);
+        console.log(`Using main entry point: ${sanitizeForLog(pkg.main)} for ${sanitizeForLog(safeAppName)}`);
       } else {
         pm2Config.script = 'index.js';
-        console.log(`Using default index.js for ${appName}`);
+        console.log(`Using default index.js for ${sanitizeForLog(safeAppName)}`);
       }
     } catch (err) {
-      console.log(`No package.json found for ${appName}, using default index.js. Error:`, err.message);
+      console.log(`No package.json found for ${sanitizeForLog(safeAppName)}, using default index.js. Error:`, sanitizeForLog(err.message));
       pm2Config.script = 'index.js';
     }
 
     // Install dependencies
     try {
       await fs.access(packageJsonPath);
-      console.log(`Installing dependencies for ${appName}...`);
+      console.log(`Installing dependencies for ${sanitizeForLog(safeAppName)}...`);
       
       let installCmd = 'npm install';
       try {
@@ -297,44 +311,44 @@ async function deploy(req, res, appName) {
         timeout: 300000,
         stdio: ['ignore', 'pipe', 'pipe']
       });
-      console.log(`Dependencies installed successfully for ${appName}`);
+      console.log(`Dependencies installed successfully for ${sanitizeForLog(safeAppName)}`);
     } catch (err) {
-      console.log(`Skipping dependency installation for ${appName}:`, err.message);
+      console.log(`Skipping dependency installation for ${sanitizeForLog(safeAppName)}:`, sanitizeForLog(err.message));
     }
 
     try {
-      execSync(`pm2 describe nlever-${appName}`, { stdio: 'ignore' });
-      console.log(`Restarting existing PM2 app: nlever-${appName}`);
-      execSync(`pm2 restart nlever-${appName} --update-env`, { timeout: 30000 });
+      execSync(`pm2 describe nlever-${safeAppName}`, { stdio: 'ignore' });
+      console.log(`Restarting existing PM2 app: nlever-${sanitizeForLog(safeAppName)}`);
+      execSync(`pm2 restart nlever-${safeAppName} --update-env`, { timeout: 30000 });
     } catch {
-      console.log(`Starting new PM2 app nlever-${appName} with config:`, JSON.stringify(pm2Config, null, 2));
+      console.log(`Starting new PM2 app nlever-${sanitizeForLog(safeAppName)} with config:`, JSON.stringify(pm2Config, null, 2));
       await fs.writeFile(paths.pm2Config, JSON.stringify({ apps: [pm2Config] }, null, 2));
       
       try {
         const result = execSync(`pm2 start ${paths.pm2Config}`, { timeout: 30000, encoding: 'utf8' });
-        console.log(`PM2 start output:`, result);
+        console.log(`PM2 start output:`, sanitizeForLog(result));
       } catch (e) {
-        console.error(`PM2 start failed for nlever-${appName}:`, e.message);
-        if (e.stdout) console.error('Stdout:', e.stdout.toString());
-        if (e.stderr) console.error('Stderr:', e.stderr.toString());
+        console.error(`PM2 start failed for nlever-${sanitizeForLog(safeAppName)}:`, e.message);
+        if (e.stdout) console.error('Stdout:', sanitizeForLog(e.stdout.toString()));
+        if (e.stderr) console.error('Stderr:', sanitizeForLog(e.stderr.toString()));
         throw new Error(`PM2 start failed: ${e.message}`);
       }
     }
 
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    console.log(`Checking PM2 status for nlever-${appName}...`);
+    console.log(`Checking PM2 status for nlever-${sanitizeForLog(safeAppName)}...`);
     try {
-      execSync(`pm2 describe nlever-${appName}`, { encoding: 'utf8' });
-      console.log(`PM2 describe succeeded for nlever-${appName}`);
+      execSync(`pm2 describe nlever-${safeAppName}`, { encoding: 'utf8' });
+      console.log(`PM2 describe succeeded for nlever-${sanitizeForLog(safeAppName)}`);
     } catch (err) {
-      console.error(`PM2 describe failed for nlever-${appName}:`, err.message);
+      console.error(`PM2 describe failed for nlever-${sanitizeForLog(safeAppName)}:`, err.message);
       rollbackNeeded = true;
       throw new Error('PM2 process failed to start');
     }
 
     if (healthCheck) {
-      const assignedPort = getAppPort(appName);
+      const assignedPort = getAppPort(safeAppName);
       const maxAttempts = 10;
       const delays = [1000, 2000, 4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000];
       let healthy = false;
@@ -378,11 +392,11 @@ async function deploy(req, res, appName) {
       }
     }
 
-    apps[appName] = {
+    apps[safeAppName] = {
       lastDeploy: timestamp,
-      pm2Name: `nlever-${appName}`,
+      pm2Name: `nlever-${safeAppName}`,
       healthCheck,
-      ...(PROXY_MODE && { port: getAppPort(appName) })
+      ...(PROXY_MODE && { port: assignedPort })
     };
     await saveRegistry();
 
@@ -396,23 +410,24 @@ async function deploy(req, res, appName) {
   } catch (error) {
     if (rollbackNeeded && previousLink) {
       try {
-        const rollbackPaths = getAppPaths(appName);
+        const rollbackPaths = getAppPaths(safeAppName);
         const previousTarget = await fs.readlink(previousLink);
         await fs.unlink(rollbackPaths.current);
         await fs.symlink(previousTarget, rollbackPaths.current);
         
-        execSync(`pm2 restart nlever-${appName} --update-env`, { timeout: 30000 });
+        execSync(`pm2 restart nlever-${safeAppName} --update-env`, { timeout: 30000 });
       } catch {}
     }
 
     sendError(res, 500, error.message);
   } finally {
-    await releaseLock(appName);
+    await releaseLock(safeAppName);
   }
 }
 
 async function rollback(req, res, appName) {
-  const paths = getAppPaths(appName);
+  const safeAppName = sanitizeAppName(appName);
+  const paths = getAppPaths(safeAppName);
   
   try {
     const previousTarget = await fs.readlink(paths.previous);
@@ -424,7 +439,7 @@ async function rollback(req, res, appName) {
     await fs.unlink(paths.previous);
     await fs.symlink(currentTarget, paths.previous);
     
-    execSync(`pm2 restart nlever-${appName} --update-env`, { timeout: 30000 });
+    execSync(`pm2 restart nlever-${safeAppName} --update-env`, { timeout: 30000 });
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'Rollback successful' }));
@@ -435,11 +450,12 @@ async function rollback(req, res, appName) {
 
 async function getStatus(req, res, appName) {
   try {
-    const info = getPM2ProcessInfo(`nlever-${appName}`);
+    const safeAppName = sanitizeAppName(appName);
+    const info = getPM2ProcessInfo(`nlever-${safeAppName}`);
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      name: appName,
+      name: sanitizeForLog(appName),
       pm2: {
         status: info.pm2_env.status,
         cpu: info.monit.cpu,
@@ -455,10 +471,11 @@ async function getStatus(req, res, appName) {
 
 async function getLogs(req, res, appName) {
   try {
+    const safeAppName = sanitizeAppName(appName);
     const url = new URL(`http://localhost${req.url}`);
     const lines = url.searchParams.get('lines') || '100';
     
-    const logs = execSync(`pm2 logs nlever-${appName} --nostream --lines ${lines}`, { 
+    const logs = execSync(`pm2 logs nlever-${safeAppName} --nostream --lines ${lines}`, { 
       encoding: 'utf8',
       timeout: 5000
     });
@@ -472,7 +489,8 @@ async function getLogs(req, res, appName) {
 
 async function stopApp(req, res, appName) {
   try {
-    execSync(`pm2 stop nlever-${appName}`, { timeout: 30000 });
+    const safeAppName = sanitizeAppName(appName);
+    execSync(`pm2 stop nlever-${safeAppName}`, { timeout: 30000 });
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'App stopped successfully' }));
@@ -483,7 +501,8 @@ async function stopApp(req, res, appName) {
 
 async function restartApp(req, res, appName) {
   try {
-    execSync(`pm2 restart nlever-${appName}`, { timeout: 30000 });
+    const safeAppName = sanitizeAppName(appName);
+    execSync(`pm2 restart nlever-${safeAppName}`, { timeout: 30000 });
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'App restarted successfully' }));
@@ -494,16 +513,17 @@ async function restartApp(req, res, appName) {
 
 async function destroyApp(req, res, appName) {
   try {
+    const safeAppName = sanitizeAppName(appName);
     try {
-      execSync(`pm2 delete nlever-${appName}`, { timeout: 30000 });
+      execSync(`pm2 delete nlever-${safeAppName}`, { timeout: 30000 });
     } catch {}
     
-    const paths = getAppPaths(appName);
+    const paths = getAppPaths(safeAppName);
     try {
       await fs.rm(paths.base, { recursive: true, force: true });
     } catch {}
     
-    delete apps[appName];
+    delete apps[safeAppName];
     await saveRegistry();
     
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -537,7 +557,7 @@ async function proxyRequest(req, res, appName, proxyPath) {
     });
 
     proxyReq.on('error', (err) => {
-      console.error(`Proxy error for ${appName}:`, err.message);
+      console.error(`Proxy error for ${sanitizeForLog(appName)}:`, sanitizeForLog(err.message));
       if (!res.headersSent) {
         sendError(res, 502, 'Proxy target unreachable');
       }
