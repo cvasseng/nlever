@@ -5,7 +5,7 @@
 // https://github.com/cvasseng/nlever
 // Licensed under the MIT License.
 
-import { promises as fs } from 'fs';
+import { promises as fs, readFileSync } from 'fs';
 import { join } from 'path';
 import { spawn, execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -18,7 +18,7 @@ let config = {};
 
 function loadConfig() {
   try {
-    const envContent = execSync(`cat ${CONFIG_FILE}`, { encoding: 'utf8' });
+    const envContent = readFileSync(CONFIG_FILE, 'utf8');
     envContent.split('\n').forEach(line => {
       const [key, value] = line.split('=');
       if (key && value) {

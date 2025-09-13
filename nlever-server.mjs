@@ -199,13 +199,15 @@ function getAppPort(appName) {
 async function deploy(req, res, appName) {
   let rollbackNeeded = false;
   let previousLink = null;
+  const safeAppName = sanitizeAppName(appName);
   
   try {
-    const safeAppName = sanitizeAppName(appName);
     await acquireLock(safeAppName);
     
     const url = new URL(`http://localhost${req.url}`);
     const healthCheck = url.searchParams.get('health_check');
+    
+    const assignedPort = PROXY_MODE ? getAppPort(safeAppName) : null;
     
     const timestamp = Date.now();
     const paths = getAppPaths(safeAppName, timestamp);
@@ -348,7 +350,6 @@ async function deploy(req, res, appName) {
     }
 
     if (healthCheck) {
-      const assignedPort = getAppPort(safeAppName);
       const maxAttempts = 10;
       const delays = [1000, 2000, 4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000];
       let healthy = false;
@@ -474,8 +475,9 @@ async function getLogs(req, res, appName) {
     const safeAppName = sanitizeAppName(appName);
     const url = new URL(`http://localhost${req.url}`);
     const lines = url.searchParams.get('lines') || '100';
+    const safeLines = /^\d+$/.test(lines) ? lines : '100';
     
-    const logs = execSync(`pm2 logs nlever-${safeAppName} --nostream --lines ${lines}`, { 
+    const logs = execSync(`pm2 logs nlever-${safeAppName} --nostream --lines ${safeLines}`, { 
       encoding: 'utf8',
       timeout: 5000
     });
@@ -557,7 +559,7 @@ async function proxyRequest(req, res, appName, proxyPath) {
     });
 
     proxyReq.on('error', (err) => {
-      console.error(`Proxy error for ${sanitizeForLog(appName)}:`, sanitizeForLog(err.message));
+      console.error('Proxy error for %s: %s', sanitizeForLog(appName), sanitizeForLog(err.message));
       if (!res.headersSent) {
         sendError(res, 502, 'Proxy target unreachable');
       }
