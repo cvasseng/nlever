@@ -489,6 +489,28 @@ async function getLogs(req, res, appName) {
   }
 }
 
+async function getLogsDownload(req, res, appName) {
+  try {
+    const safeAppName = sanitizeAppName(appName);
+    
+    const logs = execSync(`pm2 logs nlever-${safeAppName} --nostream --raw`, { 
+      encoding: 'utf8',
+      timeout: 10000
+    });
+    
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `${safeAppName}_log_${timestamp}.log`;
+    
+    res.writeHead(200, { 
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${filename}"`
+    });
+    res.end(logs);
+  } catch {
+    sendError(res, 404, 'App not found');
+  }
+}
+
 async function stopApp(req, res, appName) {
   try {
     const safeAppName = sanitizeAppName(appName);
@@ -619,6 +641,8 @@ async function handleApiRequest(req, res) {
       await getStatus(req, res, appName);
     } else if (req.method === 'GET' && action === 'logs') {
       await getLogs(req, res, appName);
+    } else if (req.method === 'GET' && action === 'logs-download') {
+      await getLogsDownload(req, res, appName);
     } else {
       sendError(res, 404, 'Not found');
     }
@@ -738,15 +762,21 @@ async function uninstall() {
 
 // Check write permissions and fallback if needed
 async function init() {
-  try {
-    // Try to create the directory first, then test write access
+  // Only try fallback if no custom NLEVER_BASE_DIR was provided
+  if (!process.env.NLEVER_BASE_DIR) {
+    try {
+      // Try to create the directory first, then test write access
+      await fs.mkdir(BASE_DIR, { recursive: true });
+      await fs.access(BASE_DIR, fs.constants.W_OK);
+    } catch {
+      console.log(`Cannot create or write to ${BASE_DIR}, using ~/nlever-apps`);
+      BASE_DIR = join(process.env.HOME, 'nlever-apps');
+      process.env.NLEVER_BASE_DIR = BASE_DIR;
+      REGISTRY_FILE = join(BASE_DIR, '.nlever-apps.json');
+    }
+  } else {
+    // Custom directory provided, just ensure it exists
     await fs.mkdir(BASE_DIR, { recursive: true });
-    await fs.access(BASE_DIR, fs.constants.W_OK);
-  } catch {
-    console.log(`Cannot create or write to ${BASE_DIR}, using ~/nlever-apps`);
-    BASE_DIR = join(process.env.HOME, 'nlever-apps');
-    process.env.NLEVER_BASE_DIR = BASE_DIR;
-    REGISTRY_FILE = join(BASE_DIR, '.nlever-apps.json');
   }
   
   await loadRegistry();

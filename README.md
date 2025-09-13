@@ -115,6 +115,9 @@ nlever status
 nlever logs
 nlever logs 500  # Last 500 lines
 
+# Download complete log file
+nlever logs-download
+
 # Rollback to previous version
 nlever rollback
 
@@ -275,6 +278,7 @@ These are the management endpoints exposed by `nlever-server`:
 - `POST /destroy/:appname` - Completely remove application
 - `GET /status/:appname` - Get PM2 process status
 - `GET /logs/:appname?lines=100` - Get application logs
+- `GET /logs-download/:appname` - Download complete log file
 
 When proxy mode is enabled, the proxy server (on `NLEVER_PROXY_PORT`) routes:
 - `GET /:appname/*` - Proxy requests to the application

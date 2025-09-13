@@ -9,7 +9,7 @@ import { promises as fs, readFileSync } from 'fs';
 import { join } from 'path';
 import { spawn, execSync } from 'child_process';
 import { tmpdir } from 'os';
-import { createReadStream } from 'fs';
+import { createReadStream, createWriteStream } from 'fs';
 import { request } from 'http';
 import { request as httpsRequest } from 'https';
 
@@ -46,8 +46,24 @@ async function createArchive() {
   
   console.log('Creating deployment archive...');
   
+  // Check if .env.nlever exists first to adjust exclusions
+  let hasEnvNlever = false;
+  try {
+    await fs.access('.env.nlever');
+    hasEnvNlever = true;
+  } catch {
+    // .env.nlever doesn't exist
+  }
+  
   // Default exclusions
-  let exclusions = ['.git', 'node_modules', '*.log', '.env*'];
+  let exclusions = ['.git', 'node_modules', '*.log'];
+  
+  // Add .env exclusions based on what files exist
+  if (hasEnvNlever) {
+    exclusions.push('.env'); // Exclude development .env, but allow .env.nlever
+  } else {
+    exclusions.push('.env*'); // Exclude all .env files when no .env.nlever
+  }
   
   // Use custom exclusions if specified
   if (config.NLEVER_EXCLUSIONS) {
@@ -60,14 +76,10 @@ async function createArchive() {
     tarArgs.push(`--exclude=${pattern}`);
   });
   
-  // Check if .env.nlever exists - if so, rename it to .env and exclude existing .env
-  try {
-    await fs.access('.env.nlever');
+  // If .env.nlever exists, rename it to .env in the archive
+  if (hasEnvNlever) {
     tarArgs.push('--transform', 's/.env.nlever$/.env/');
-    tarArgs.push('--exclude=.env');
     console.log('Using .env.nlever as .env in deployment (excluding any existing .env)');
-  } catch {
-    // .env.nlever doesn't exist, no-op
   }
   
   tarArgs.push('-czf', archivePath, '.');
@@ -102,6 +114,11 @@ async function httpRequest(method, path, options = {}) {
   const [host, port = '8081'] = config.NLEVER_HOST.split(':');
   const isHttps = port === '443' || config.NLEVER_HOST.startsWith('https://');
   const requestFn = isHttps ? httpsRequest : request;
+  
+  // Log connection only once per command (not for progress updates)
+  if (!options.skipConnectionLog) {
+    console.log(`Connecting to server at ${host}:${port}`);
+  }
   
   const headers = options.headers || {};
   if (config.NLEVER_AUTH) {
@@ -272,6 +289,26 @@ async function logs() {
   }
 }
 
+async function logsDownload() {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `${config.NLEVER_NAME}_log_${timestamp}.log`;
+  
+  console.log(`Downloading logs to ${filename}...`);
+  
+  const fileStream = createWriteStream(filename);
+  
+  const { statusCode } = await httpRequest('GET', `/logs-download/${config.NLEVER_NAME}`, {
+    pipe: fileStream
+  });
+  
+  if (statusCode === 200) {
+    console.log(`✓ Logs downloaded to ${filename}`);
+  } else {
+    console.error(`\n✗ Failed to download logs with status ${statusCode}`);
+    throw new Error('Failed to download logs');
+  }
+}
+
 async function stop() {
   const { statusCode, body } = await httpRequest('POST', `/stop/${config.NLEVER_NAME}`);
   
@@ -428,6 +465,9 @@ async function run() {
       case 'logs':
         await logs();
         break;
+      case 'logs-download':
+        await logsDownload();
+        break;
       case 'stop':
         await stop();
         break;
@@ -445,6 +485,7 @@ async function run() {
         console.log('  rollback  - Rollback to previous version');
         console.log('  status    - Check app status');
         console.log('  logs [n]  - Get app logs (default 100 lines)');
+        console.log('  logs-download - Download complete log file');
         console.log('  stop      - Stop the app');
         console.log('  restart   - Restart the app');
         console.log('  destroy   - Completely remove the app');
