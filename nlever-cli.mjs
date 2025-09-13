@@ -99,7 +99,7 @@ function formatNetworkError(error, host, port) {
 }
 
 async function httpRequest(method, path, options = {}) {
-  const [host, port = '80'] = config.NLEVER_HOST.split(':');
+  const [host, port = '8081'] = config.NLEVER_HOST.split(':');
   const isHttps = port === '443' || config.NLEVER_HOST.startsWith('https://');
   const requestFn = isHttps ? httpsRequest : request;
   

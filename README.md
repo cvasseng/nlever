@@ -81,7 +81,7 @@ Or manually create a `.env` file:
 
 ```env
 NLEVER_NAME=myapp
-NLEVER_HOST=server.lan:8081
+NLEVER_HOST=server.lan              # Port defaults to 8081 if not specified
 NLEVER_AUTH=your-secret-token       # Optional, must match server
 NLEVER_HEALTH_CHECK=/health         # Optional, endpoint to verify deployment
 NLEVER_EXCLUSIONS=.git,node_modules,*.log  # Optional, custom exclusion patterns
@@ -293,7 +293,7 @@ When proxy mode is enabled, the proxy server (on `NLEVER_PROXY_PORT`) routes:
 
 ### Client
 - `NLEVER_NAME` - Application name
-- `NLEVER_HOST` - Server host:port
+- `NLEVER_HOST` - Server host:port (port defaults to 8081 if not specified)
 - `NLEVER_AUTH` - Authentication token (optional)
 - `NLEVER_HEALTH_CHECK` - Health endpoint path (optional)
 - `NLEVER_EXCLUSIONS` - Custom exclusion patterns, comma-separated (optional, overrides defaults)
