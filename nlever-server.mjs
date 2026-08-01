@@ -120,6 +120,33 @@ function getAppPaths(appName, timestamp = null) {
 }
 
 
+/*
+Write the current process list to pm2's dump file.
+
+`pm2 startup` installs a boot unit that runs `pm2 resurrect`, which restores the list
+as it was at the last `pm2 save` - and nothing here used to call it except --install.
+So a server that had been set up for auto-start, exactly as the README describes,
+came back from a reboot running whatever was deployed when it was installed: usually
+nothing at all.
+
+Called after every change to the LIST rather than on a timer, so the saved state and
+the running state cannot drift. A failure is logged and swallowed: the deploy itself
+succeeded, and taking it down because the dump could not be written would be the
+worse outcome.
+*/
+function persistProcessList() {
+  try {
+    // --force because a plain `pm2 save` REFUSES to write when the list is empty
+    // ("PM2 is not managing any process, skipping save"). Destroying the last app
+    // would otherwise leave the previous dump in place, and the next reboot would
+    // resurrect an app whose release directory destroy() had just deleted.
+    execSync('pm2 save --force', { timeout: 30000, stdio: 'ignore' });
+  } catch (err) {
+    console.error('Warning: could not save the pm2 process list -', err.message);
+    console.error('  Deployed apps will not come back automatically after a reboot.');
+  }
+}
+
 function getPM2ProcessInfo(pm2Name) {
   try {
     const output = execSync('pm2 jlist', { encoding: 'utf8' });
@@ -322,6 +349,7 @@ async function deploy(req, res, appName) {
       execSync(`pm2 describe nlever-${safeAppName}`, { stdio: 'ignore' });
       console.log(`Restarting existing PM2 app: nlever-${sanitizeForLog(safeAppName)}`);
       execSync(`pm2 restart nlever-${safeAppName} --update-env`, { timeout: 30000 });
+      persistProcessList();
     } catch {
       console.log(`Starting new PM2 app nlever-${sanitizeForLog(safeAppName)} with config:`, JSON.stringify(pm2Config, null, 2));
       await fs.writeFile(paths.pm2Config, JSON.stringify({ apps: [pm2Config] }, null, 2));
@@ -329,6 +357,7 @@ async function deploy(req, res, appName) {
       try {
         const result = execSync(`pm2 start ${paths.pm2Config}`, { timeout: 30000, encoding: 'utf8' });
         console.log(`PM2 start output:`, sanitizeForLog(result));
+        persistProcessList();
       } catch (e) {
         console.error(`PM2 start failed for nlever-${sanitizeForLog(safeAppName)}:`, e.message);
         if (e.stdout) console.error('Stdout:', sanitizeForLog(e.stdout.toString()));
@@ -515,7 +544,10 @@ async function stopApp(req, res, appName) {
   try {
     const safeAppName = sanitizeAppName(appName);
     execSync(`pm2 stop nlever-${safeAppName}`, { timeout: 30000 });
-    
+    // Saved so a stopped app stays stopped across a reboot. Without this it is
+    // resurrected running, which is the opposite of what was asked for.
+    persistProcessList();
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, message: 'App stopped successfully' }));
   } catch {
@@ -540,8 +572,11 @@ async function destroyApp(req, res, appName) {
     const safeAppName = sanitizeAppName(appName);
     try {
       execSync(`pm2 delete nlever-${safeAppName}`, { timeout: 30000 });
+      // Otherwise a destroyed app is resurrected at the next reboot, pointing at a
+      // release directory this function is about to remove.
+      persistProcessList();
     } catch {}
-    
+
     const paths = getAppPaths(safeAppName);
     try {
       await fs.rm(paths.base, { recursive: true, force: true });
@@ -710,27 +745,58 @@ async function handleProxyRequest(req, res) {
   }
 }
 
+// Every setting the server reads at startup. pm2 launches a FRESH node process, so
+// anything missing from its env is simply absent when the server actually runs -
+// which is why `NLEVER_PROXY=yes nlever-server --install` used to produce a server
+// with proxy mode off: the variable configured the install command and nothing else.
+//
+// The raw environment values are copied rather than the derived constants at the top
+// of this file, because the server re-derives them itself and a derived value can
+// round-trip wrongly - PROXY_MODE is a boolean, and `true` is not `'yes'`.
+const SERVER_ENV = [
+  'NLEVER_PORT',
+  'NLEVER_BASE_DIR',
+  'NLEVER_AUTH_TOKEN',
+  'NLEVER_PROXY',
+  'NLEVER_PROXY_PORT',
+  'NLEVER_APP_LISTINGS',
+  'NLEVER_ADMIN_IPS_ALLOW',
+  'NLEVER_PROXY_IPS_ALLOW'
+];
+
 async function install() {
+  const configFile = join(tmpdir(), 'nlever-server-pm2.json');
+
   try {
     const serverPath = process.argv[1];
+
+    // Defaults first, so the recorded config says what the server will do rather
+    // than leaving it to be re-derived; anything explicitly set then wins.
+    const env = {
+      NLEVER_PORT: PORT,
+      NLEVER_BASE_DIR: process.env.NLEVER_BASE_DIR || BASE_DIR
+    };
+
+    for (const key of SERVER_ENV) {
+      if (process.env[key] !== undefined) env[key] = process.env[key];
+    }
+
     const pm2Config = {
       name: 'nlever-server',
       script: serverPath,
-      env: {
-        NLEVER_PORT: PORT,
-        NLEVER_BASE_DIR: process.env.NLEVER_BASE_DIR || BASE_DIR,
-        ...(AUTH_TOKEN && { NLEVER_AUTH_TOKEN: AUTH_TOKEN })
-      },
+      env,
       autorestart: true,
       watch: false
     };
-    
-    const configFile = '/tmp/nlever-server-pm2.json';
-    await fs.writeFile(configFile, JSON.stringify({ apps: [pm2Config] }, null, 2));
-    
+
+    // 0600: this file carries NLEVER_AUTH_TOKEN through a world-readable directory.
+    await fs.writeFile(configFile, JSON.stringify({ apps: [pm2Config] }, null, 2), {
+      mode: 0o600
+    });
+
     execSync(`pm2 start ${configFile}`, { stdio: 'inherit' });
     execSync('pm2 save', { stdio: 'inherit' });
-    
+
     try {
       execSync('pm2 startup', { stdio: 'inherit' });
       console.log('✓ PM2 startup script created');
@@ -738,14 +804,18 @@ async function install() {
       console.log('⚠ PM2 startup script creation failed (requires root privileges)');
       console.log('  Run "sudo pm2 startup" once for auto-start on boot');
     }
-    
-    await fs.unlink(configFile);
-    
+
     console.log('✓ nlever-server installed and started with PM2');
     console.log(`✓ Server running on port ${PORT}`);
+    console.log(`✓ Proxy mode: ${PROXY_MODE ? `enabled on port ${PROXY_PORT}` : 'disabled'}`);
   } catch (error) {
     console.error('✗ Installation failed:', error.message);
-    process.exit(1);
+    // exitCode rather than process.exit(), which terminates immediately and would
+    // skip the cleanup below - leaving the auth token in the temp directory on
+    // exactly the path that needs it removed.
+    process.exitCode = 1;
+  } finally {
+    await fs.unlink(configFile).catch(() => {});
   }
 }
 
