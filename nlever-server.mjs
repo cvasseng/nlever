@@ -322,10 +322,23 @@ async function deploy(req, res, appName) {
     }
 
     // Install dependencies
+    //
+    // A failed install used to be logged and stepped over, so the deploy went on
+    // to restart pm2 and answer 200: a release whose dependencies never landed
+    // was reported as a success and then crash-looped. The two ways that happens
+    // in practice - yarn missing from the PATH pm2 handed this server, and an
+    // engines field the installed node cannot satisfy - both fail in well under
+    // a second and carry nothing but an exit code, which is why the command's
+    // own output is captured and logged rather than discarded.
+    let needsInstall = true;
     try {
       await fs.access(packageJsonPath);
-      console.log(`Installing dependencies for ${sanitizeForLog(safeAppName)}...`);
-      
+    } catch {
+      needsInstall = false;
+      console.log(`No package.json for ${sanitizeForLog(safeAppName)}, nothing to install`);
+    }
+
+    if (needsInstall) {
       let installCmd = 'npm install';
       try {
         await fs.access(join(paths.release, 'yarn.lock'));
@@ -334,15 +347,39 @@ async function deploy(req, res, appName) {
       } catch {
         console.log('Using npm install');
       }
-      
-      execSync(installCmd, { 
-        cwd: paths.release, 
-        timeout: 300000,
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-      console.log(`Dependencies installed successfully for ${sanitizeForLog(safeAppName)}`);
-    } catch (err) {
-      console.log(`Skipping dependency installation for ${sanitizeForLog(safeAppName)}:`, sanitizeForLog(err.message));
+
+      console.log(`Installing dependencies for ${sanitizeForLog(safeAppName)}...`);
+
+      try {
+        execSync(installCmd, {
+          cwd: paths.release,
+          timeout: 300000,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+        console.log(`Dependencies installed successfully for ${sanitizeForLog(safeAppName)}`);
+      } catch (err) {
+        const output = [err.stdout, err.stderr]
+          .map(stream => (stream ? stream.toString() : ''))
+          .join('\n')
+          .split('\n')
+          .map(line => sanitizeForLog(line).trim())
+          .filter(Boolean);
+
+        console.error(`Dependency installation failed for ${sanitizeForLog(safeAppName)} (${installCmd}):`);
+        for (const line of output) console.error(`  ${line}`);
+
+        // The current symlink already points at the new release but pm2 has not
+        // been restarted yet, so rolling back here leaves the app running the
+        // release it was already on.
+        rollbackNeeded = true;
+        // Both installers bury the actual cause among progress chatter, so the
+        // client-facing line prefers the lines they mark as errors.
+        const errorLines = output.filter(line => /^(error|npm err|err!)/i.test(line));
+        const reason = (errorLines.length ? errorLines : output).slice(-3).join(' / ') || err.message;
+        throw new Error(
+          `Dependency installation failed (${installCmd}): ${reason.slice(0, 500)}`
+        );
+      }
     }
 
     try {
